@@ -150,6 +150,57 @@ namespace
         REQUIRE(false);
     }
 
+    // A child async that owns its own cancellation token and states its own preference.
+    // Cancelling it exercises the two promise-side sites plus signal_awaiter, all of
+    // which consult this coroutine's own promise.
+    IAsyncAction CancellableChildAction(HANDLE started, bool originate)
+    {
+        co_await resume_background();
+
+        auto cancel = co_await get_cancellation_token();
+        cancel.enable_propagation();
+        cancel.originate_on_cancel(originate);
+
+        SetEvent(started);
+        co_await resume_on_signal(GetCurrentProcess()); // never wakes
+        REQUIRE(false);
+    }
+
+    // Awaits the child from a fire_and_forget, whose promise_type does NOT derive from
+    // cancellable_promise. The awaiting coroutine therefore has no preference of its own
+    // to state, and cannot be given one -- fire_and_forget has no await_transform for
+    // get_cancellation_token.
+    fire_and_forget FireAndForgetParent(IAsyncAction child, HANDLE done)
+    {
+        try
+        {
+            co_await child;
+        }
+        catch (hresult_canceled const&)
+        {
+        }
+
+        SetEvent(done);
+    }
+
+    // The same shape, but awaiting from a coroutine whose promise IS cancellable, so it
+    // can state a preference of its own.
+    IAsyncAction AsyncActionParent(IAsyncAction child, HANDLE done, bool originate)
+    {
+        auto cancel = co_await get_cancellation_token();
+        cancel.originate_on_cancel(originate);
+
+        try
+        {
+            co_await child;
+        }
+        catch (hresult_canceled const&)
+        {
+        }
+
+        SetEvent(done);
+    }
+
     void WaitForCompletion(HANDLE completed)
     {
         REQUIRE(WaitForSingleObject(completed, IsDebuggerPresent() ? INFINITE : 10000) == WAIT_OBJECT_0);
@@ -239,6 +290,60 @@ namespace
     {
         return CountOriginations(RepeatedChecksAction, originate, true);
     }
+
+    // Cancels a child async that stated its own origination preference, while it is being
+    // awaited by a parent coroutine, and counts what originated.
+    template <typename F>
+    int CountOriginationsOnAwaitedChild(F startParent, bool originate)
+    {
+        handle started{ CreateEvent(nullptr, true, false, nullptr) };
+        handle done{ CreateEvent(nullptr, true, false, nullptr) };
+        int originations = 0;
+
+        {
+            origination_counter counter;
+
+            auto child = CancellableChildAction(started.get(), originate);
+            startParent(child, done.get());
+
+            // Let the child park on its cancellable await and the parent reach its
+            // co_await of the child before cancelling.
+            WaitForCompletion(started.get());
+            Sleep(500);
+
+            child.Cancel();
+            WaitForCompletion(done.get());
+
+            originations = counter.count();
+            REQUIRE(child.Status() == AsyncStatus::Canceled);
+        }
+
+        return originations;
+    }
+
+    int CountOriginationsAwaitedByFireAndForget(bool originate)
+    {
+        return CountOriginationsOnAwaitedChild(
+            [](IAsyncAction const& child, HANDLE done) { FireAndForgetParent(child, done); },
+            originate);
+    }
+
+    int CountOriginationsAwaitedByAsyncAction(bool originate)
+    {
+        return CountOriginationsOnAwaitedChild(
+            [originate](IAsyncAction const& child, HANDLE done) { AsyncActionParent(child, done, originate); },
+            originate);
+    }
+
+    // An opted-out child awaited by an IAsyncAction parent that did NOT opt out. Shows
+    // that a cancellable promise is necessary but not sufficient: the awaiting coroutine
+    // states its own preference, and the default is to originate.
+    int CountOriginationsOnOptedOutChildWithOriginatingParent()
+    {
+        return CountOriginationsOnAwaitedChild(
+            [](IAsyncAction const& child, HANDLE done) { AsyncActionParent(child, done, true); },
+            false);
+    }
 }
 
 // NOTE: tagged [.clang-crash] for consistency with every other async cancellation test in
@@ -296,5 +401,31 @@ TEST_CASE("async_originate_count_on_cancel")
     {
         REQUIRE(CountOriginationsOnPropagatedCancel(ResumeOnSignalAction, true) == 2);
         REQUIRE(CountOriginationsOnPropagatedCancel(ResumeOnSignalAction, false) == 0);
+    }
+
+    // A child that states its own preference, awaited by a coroutine whose promise is
+    // cancellable. Child's Cancel, child's signal_awaiter, then the parent's
+    // await_adapter -> check_status_canceled.
+    SECTION("child awaited by IAsyncAction")
+    {
+        REQUIRE(CountOriginationsAwaitedByAsyncAction(true) == 3);
+        REQUIRE(CountOriginationsAwaitedByAsyncAction(false) == 0);
+    }
+
+    // The same child awaited by a fire_and_forget, whose promise_type does not derive
+    // from cancellable_promise. The child's own sites are suppressed, but the awaiting
+    // coroutine has no preference to state, so its await_adapter still originates.
+    SECTION("child awaited by fire_and_forget")
+    {
+        REQUIRE(CountOriginationsAwaitedByFireAndForget(true) == 3);
+        REQUIRE(CountOriginationsAwaitedByFireAndForget(false) == 1);
+    }
+
+    // Giving the awaiting coroutine a cancellable promise is not by itself enough: it
+    // must also opt out, since await_adapter captures that coroutine's own preference and
+    // the default is to originate.
+    SECTION("opted-out child awaited by originating parent")
+    {
+        REQUIRE(CountOriginationsOnOptedOutChildWithOriginatingParent() == 1);
     }
 }
